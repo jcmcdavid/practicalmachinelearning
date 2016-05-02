@@ -1,0 +1,409 @@
+---
+title: "Analysis and Prediction of Weightlifting Competency (PML)"
+author: "John C McDavid"
+date: "May 1, 2016"
+output: 
+  html_document: 
+    fig_caption: yes
+    keep_md: yes
+---
+
+# Objective  
+The objective of this study is to develop a practical machine learning algorithm that will predict the manner (the correct way and five incorrect ways) in which volunteers lift dumbbells in a weightlifting exercise. After using a dataset to train the algorithm, the accuracy of the algorithm will be measured against a test dataset.  
+
+## Overview  
+A research study was done in furtherance of human activity recognition research to develop an algorithm that could discriminate between the various ways a person might perform a weightlifting activity. Six young healthy participants were asked to execute a series of sets of repetitions of the Unilateral Dumbbell Biceps Curl in five incorrect ways and one correct way. Various measurements were taken during each set of repetitions along with the manner in which the volunteers were asked to perform the exercise.  
+The five variations of doing the weightlifting exercise were:  
+  A correct way  
+  B throw elbows to front  
+  C lift halfway  
+  D lower halfway  
+  E throw hips to front  
+
+## Citation and reference  
+This anlysis is this paper uses data from the following research:
+Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6. Read more at http://groupware.les.inf.puc-rio.br/har#ixzz47MfWwhbW.  
+
+## Approach  
+In this paper we will develop an algorithm to discriminate between the variosu ways the researchers had the particpants periform the weightlifting exercise. We ultimately settle on using a random forest method as the best method to develop an algorithm to meet the objective but we also explore the possibilities of using random forest with the data centered and scaled, gbm, and lda. The alternative models were all inferior or did not add appreciable accuracy.  
+Cross-validation is handled internal to the caret::train function through train control.  
+We also use parallel processing to help with run time.  
+
+## Data  
+The training and test data for the project are from:  
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv  
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv  
+
+We initialize and clear the workspace, load and read in the data, and load the necessary R libaries (we assume the libararies are installed).  
+
+```{r}
+setwd("C:\\Users\\jcmcd\\Coursera - Practical Machine Learning")
+rm(list=ls())
+
+# libraries
+library(caret); library(ggplot2); library(lattice); library(rpart); library(rpart.plot)
+library(doParallel); library(parallel); library(randomForest)
+library(rattle); library(corrplot)
+
+# load data
+# training
+fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv?accessType=DOWNLOAD"
+download.file(fileUrl, destfile="./data/pml-train.csv")
+Train <- read.csv("./data/pml-train.csv")
+# testing
+fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv?accessType=DOWNLOAD"
+download.file(fileUrl, destfile="./data/pml-test.csv")
+Test <- read.csv("./data/pml-test.csv")
+
+```
+
+## Exploratory Analysis  
+We explore the dataset.  
+```{r}
+unique(Train$classe)
+dim(Train); dim(Test)
+sum(Train$classe == "A")
+sum(Train$classe == "B")
+sum(Train$classe == "C")
+sum(Train$classe == "D")
+sum(Train$classe == "E")
+sum(5580, 3797, 3422, 3216, 3607)
+names(Train)
+```
+
+## Cleaning  
+We have to remove columns that have missing data and remove seven other cols (X, user name, 3 timestamps, 2 "windows") that aren't useful. This results in 53 remaining variables, including the outcome variable "classe."  
+We then apply the same removal to the test dataset and check to make sure there are no additional cols in the test 
+dataset that need to be removed (there aren't any).  
+Finally, we make sure the fields in the train and test datasets are the same (except for the outcome variable in the train set and the problem_id variable in the test set.)  
+
+```{r}
+# have to elim cols that have NA or ""
+msgcols2 <- sapply(Train, function(x) any(is.na(x) | x == ""))
+sum(msgcols2)
+
+TrainCln1 <- names(msgcols2)[!msgcols2]
+TrainCln2 <- TrainCln1[-c(1:7)]
+
+Train2 <- Train[,TrainCln2]
+dim(Train2)
+
+# do same clean on test, make sure nothing additional is msg in test
+Test2 <- Test[,c(TrainCln2[-53],"problem_id")]
+dim(Test2)
+# [1] 20 53
+msgcols2test <- sapply(Test2, function(x) any(is.na(x) | x == ""))  # ck for additional msg cols in Test
+sum(msgcols2test)  # any addit'l cols w missing vals?
+
+sum(names(Train2) == names(Test2))
+```
+
+## Partitioning  
+We set a seed and partition the cleaned train dataset into training and testing datasets using a 70/30 split.  The original test dataset is held out from the aanlysis.  
+
+```{r}
+set.seed(526526)
+inTrain <- createDataPartition(y = Train2$classe,
+                               p = 0.7, list = FALSE)
+TrainClnTrain <- Train2[inTrain,]
+TrainClnTest <- Train2[-inTrain,]
+```
+
+## Test for near zero variance of predictors and linear combinations of cols.
+```{r}
+# test nzv nearZeroVar on training
+nzv <- nearZeroVar(TrainClnTrain, saveMetrics = TRUE)
+# nzv
+sum(nzv[,3],nzv[,4])    # any zero or near zero variances?
+
+# look for linear combins
+findLinearCombos(Train2[,-53])
+```
+
+We now have cleaned Train2, Test2 datasets + Train2 partitioned to TrainClnTrain, TrainClnTest
+```{r}
+dim(Train2)
+dim(TrainClnTrain)
+dim(TrainClnTest)
+```
+
+## More Exploration
+As an initial exploration, we fit a random forest tree and plot a dendrogram of what we might expect. We also do a correlation matrix plot.  
+```{r}
+
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+mstart <- Sys.time()
+Agraph <- rpart(classe ~ ., data = TrainClnTrain, method = "class")
+mend <- Sys.time()
+c(mstart, mend)
+
+stopCluster(cluster)   # de-register parallel process cluster
+
+prp(Agraph)
+
+# fancyRpartPlot(Agraph)      # works but tooo many bottow rows....prp more readable
+
+cPlot <- cor(TrainClnTrain[,-53])
+corrplot(cPlot, method = "color")
+```
+
+# Main Model 4.
+After model testing and review we settle on a random forest model to predict the manner in which the weightlifting exercise was performed. The accuracy was best using this model.  Centering and scaling was tested but found not to give more than a negligible improvement so wasn't done in the final model used.  
+Alternative models were tested and are briefly described below.
+Cross validation was handled internal to training through train control.  The out of sample error rate (OOB) was 0.72%.  Our out of sample error rate as measured on the test partition of the original train dataset is 0.66%.  
+We also look at variable importance.  
+Finally, we make our predictions on the original testing dataset provided in the downloads.  
+```{r}
+library(doParallel)
+library(parallel)
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(526)
+ctrl <- trainControl(method="cv", number = 10, allowParallel = TRUE)
+
+mstart <- Sys.time()
+modFit4 <- train(classe ~ ., method = "rf", data = TrainClnTrain, trControl = ctrl)
+mend <- Sys.time()
+c(mstart, mend)
+
+stopCluster(cluster)
+
+modFit4
+
+modFit4$finalModel
+
+varImp(modFit4)
+# order(varImp(modFit4), decreasing = T)
+
+varImp(modFit4, scale = "TRUE")
+# order(varImp(modFit4), decreasing = T)
+
+# plot tree
+
+# predict on trainclntest
+pred.modFit4 <- predict(modFit4, TrainClnTest)
+confusionMatrix(TrainClnTest$classe, pred.modFit4)
+Accuracy <- postResample(pred.modFit4, TrainClnTest$classe)
+Accuracy
+
+# out of sample error is 1 - Accuracy on testing set
+1- Accuracy
+
+# report noth oob and traincln test err rate???
+
+# now predict on Test set fron original download ....P
+pred.modFit4Test <- predict(modFit4, Test2)
+pred.modFit4Test
+
+# end 4 ...works
+```
+
+Graphing:  
+```{r}
+# 4.1.2 for graphing
+
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+mstart <- Sys.time()
+Agraph <- rpart(classe ~ ., data = TrainClnTrain, method = "class")
+mend <- Sys.time()
+c(mstart, mend)
+
+stopCluster(cluster)   # de-register parallel process cluster
+
+
+prp(Agraph)     # works
+
+fancyRpartPlot(Agraph)      # works but tooo many bottow rows....prp more readable
+```
+
+## Results/Conclusions
+The random forest model with internal cross validation proved to be teh most accurate model of all the model types tested. The predictions made on the test dataset are reported above.  
+
+## End of results and model
+
+## Model Alternatives
+Several models were tested as alternative possibilities, none performing as well as the above. Here we show the gbm, lda, and rf with centering and scaling models.
+
+### GBM model
+This model is not as good as the chosen random forest model; the out of sample error rate is 4%.  
+```{r}
+# -------------------------
+# 4.2 w gbm (c/p from 4 w modif)
+library(doParallel)
+library(parallel)
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(526)
+ctrl <- trainControl(method="cv", number = 10, allowParallel = TRUE)
+
+mstart <- Sys.time()
+modFit4.2 <- train(classe ~ ., method = "gbm", data = TrainClnTrain, trControl = ctrl)    # method gbm
+mend <- Sys.time()
+# 
+stopCluster(cluster)
+c(mstart, mend)
+
+modFit4.2
+
+modFit4.2$finalModel
+
+postResample(predict(modFit4.2,TrainClnTrain),TrainClnTrain$classe)
+
+varImp(modFit4.2)
+# order(varImp(modFit4.2), decreasing = T)
+
+varImp(modFit4.2, scale = "TRUE")
+# order(varImp(modFit4.2), decreasing = T)
+
+# predict on trainclntest
+pred.modFit4.2 <- predict(modFit4.2, TrainClnTest)
+confusionMatrix(TrainClnTest$classe, pred.modFit4.2)
+Accuracy <- postResample(pred.modFit4.2, TrainClnTest$classe)
+Accuracy
+
+# out of sample error is 1 - Accuracy on testing set
+1- Accuracy
+
+# now predict on Test set fron original download ....P
+pred.modFit4.2Test <- predict(modFit4.2, Test2)
+pred.modFit4.2Test
+
+# end 4.2
+# -------------------------
+```
+
+### lda model:  
+The linear discriminate analysis model is awful and all characteristics make it a vastly inferior model (out of sample error rate is 29%).  
+```{r}
+# 4.3 lda
+library(doParallel)
+library(parallel)
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(526)
+ctrl <- trainControl(method="cv", number = 10, allowParallel = TRUE)
+
+mstart <- Sys.time()
+modFit4.3 <- train(classe ~ ., method = "lda", data = TrainClnTrain, trControl = ctrl)    # method lda
+mend <- Sys.time()
+# 
+stopCluster(cluster)
+c(mstart, mend)
+
+modFit4.3
+
+# modFit4.3$finalModel
+
+postResample(predict(modFit4.3,TrainClnTrain),TrainClnTrain$classe)
+
+# predict on trainclntest
+pred.modFit4.3 <- predict(modFit4.3, TrainClnTest)
+confusionMatrix(TrainClnTest$classe, pred.modFit4.3)
+Accuracy <- postResample(pred.modFit4.3, TrainClnTest$classe)
+Accuracy
+
+# out of sample error is 1 - Accuracy on testing set
+1- Accuracy
+# --> 28.89%
+
+# now predict on Test set fron original download ....P
+pred.modFit4.3Test <- predict(modFit4.3, Test2)
+pred.modFit4.3Test
+
+# end 4.3
+
+# -------------------------
+```
+
+## rf model 4.1 with preprocess Ctr, Scale  
+Centering and scaling gives negligible improvement to teh random forest model so was not used.  
+```{r}
+library(doParallel)
+library(parallel)
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(526)
+ctrl <- trainControl(method="cv", number = 10, allowParallel = TRUE)
+mstart <- Sys.time()
+modFit4.1 <- train(classe ~ ., method = "rf", data = TrainClnTrain, preProcess=c("center", "scale"), trControl = ctrl)
+mend <- Sys.time()
+c(mstart, mend)
+
+stopCluster(cluster)   # de-register parallel process cluster
+
+modFit4.1
+
+modFit4.1$finalModel
+
+# predict on TrainClnTest
+pred.modFit4.1 <- predict(modFit4.1, TrainClnTest)
+confusionMatrix(TrainClnTest$classe, pred.modFit4.1)
+Accuracy <- postResample(pred.modFit4.1, TrainClnTest$classe)
+Accuracy
+
+# out of sample error is 1 - Accuracy on testing set
+1- Accuracy
+# error went from .71% up to .75%
+pred.modFit4.1Test <- predict(modFit4.1, Test2)
+pred.modFit4.1Test                   
+
+# end 4.1
+# -------------------------
+```
+
+## 4.1.1 rf model with centering and scaling done a different way...results are the same  
+Comments are the same as above.  
+```{r}
+library(doParallel)
+library(parallel)
+cluster <- makeCluster(detectCores() - 1)    # convention is to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(526)
+ctrl <- trainControl(method="cv", number = 10, allowParallel = TRUE)
+preObj <- preProcess(TrainClnTrain[,-53], method = c("center", "scale"))    # step 1
+TrainClnTrain.cs <- predict(preObj, TrainClnTrain)                          # step 2a
+mstart <- Sys.time()
+modFit4.1.1 <- train(classe ~ ., method = "rf", data = TrainClnTrain.cs, trControl = ctrl)    # step 3
+mend <- Sys.time()
+
+stopCluster(cluster)   # de-register parallel process cluster
+c(mstart, mend)
+
+TrainClnTest.cs <- predict(preObj, TrainClnTest)                            # step 2b1
+Test2.cs <- predict(preObj, Test2)                                          # step 2b2
+
+modFit4.1.1
+
+modFit4.1.1$finalModel
+# similar, sl lower err rate
+
+# predict on TrainClnTest.cs
+pred.modFit4.1.1 <- predict(modFit4.1.1, TrainClnTest.cs)
+confusionMatrix(TrainClnTest.cs$classe, pred.modFit4.1.1)
+Accuracy <- postResample(pred.modFit4.1.1, TrainClnTest.cs$classe)
+Accuracy
+#  acurr is same, kappa diff in last dec
+
+# out of sample error is 1 - Accuracy on testing set
+1- Accuracy
+# error .75%
+pred.modFit4.1.1Test.cs <- predict(modFit4.1.1, Test2.cs)
+pred.modFit4.1.1Test.cs                   
+
+# end 4.1.1
+# -------------------------
+```
+
+# End Report
+```{r}
+Sys.time()
+```
